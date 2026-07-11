@@ -155,6 +155,7 @@ beta         = d["beta"]
 sp500_ann    = d["sp500_ann"]
 sp500_vol    = d["sp500_vol"]
 sp500_sharpe = d["sp500_sharpe"]
+
 tickers  = d["tickers"]
 weights  = d["weights"]
 portfolio= d["portfolio"]

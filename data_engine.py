@@ -250,7 +250,7 @@ def load_portfolio_data(portfolio_tuple):
     cum    = (1 + port_a).cumprod()
     max_dd = ((cum - cum.cummax()) / cum.cummax()).min()
 
-    monthly = port_a.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+    monthly = port_a.resample("M").apply(lambda x: (1 + x).prod() - 1)
     var95   = safe_percentile(monthly, 5)
 
     port_1d  = np.asarray(port_a).flatten()
@@ -307,7 +307,7 @@ def load_portfolio_data(portfolio_tuple):
         ar     = ret_fx.mean() * DAYS
         sh     = ar / av if av > 0 else 0.0
         carry  = CARRY_RATES.get(base, 0.03) - CARRY_RATES.get(quote, 0.03)
-        m_fx   = ret_fx.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+        m_fx   = ret_fx.resample("M").apply(lambda x: (1 + x).prod() - 1)
         v95_fx = safe_percentile(m_fx, 5)
         c_fx   = (1 + ret_fx).cumprod()
         mdd_fx = ((c_fx - c_fx.cummax()) / c_fx.cummax()).min()

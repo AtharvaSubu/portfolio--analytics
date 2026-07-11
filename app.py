@@ -139,8 +139,12 @@ if st.session_state["portfolio_data"] is None and not st.session_state["error"]:
     st.stop()
 
 # ── Main dashboard (data loaded) ──────────────────────────────────────────────
-d           = st.session_state["portfolio_data"]
+d = st.session_state.get("portfolio_data", None)
 simple_mode = st.session_state.get("simple_mode", True)
+
+if d is None:
+    st.warning("Portfolio data is not available. Please re-enter your tickers and click Analyze Portfolio.")
+    st.stop()
 
 ann_ret      = d["ann_return"]
 ann_vol      = d["ann_vol"]
@@ -151,7 +155,6 @@ beta         = d["beta"]
 sp500_ann    = d["sp500_ann"]
 sp500_vol    = d["sp500_vol"]
 sp500_sharpe = d["sp500_sharpe"]
-
 tickers  = d["tickers"]
 weights  = d["weights"]
 portfolio= d["portfolio"]

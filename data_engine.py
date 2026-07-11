@@ -1,7 +1,5 @@
 """
-data_engine.py
-All data fetching and computation lives here.
-Streamlit pages import from this file — nothing else needed.
+data_engine.py — with Yahoo Finance session header fix for Streamlit Cloud
 """
 
 import warnings
@@ -18,8 +16,44 @@ from sklearn.linear_model import LinearRegression
 from datetime import datetime, timedelta
 
 
+# ── Yahoo Finance session fix ─────────────────────────────────────────────────
+# Streamlit Cloud blocks plain yfinance requests.
+# Passing a browser-like session header bypasses the 403 block.
+def _get_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return session
+
+
+def yf_download(tickers, start, end):
+    """Download price data with session header fix."""
+    session = _get_yf_session()
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    try:
+        raw = yf.download(
+            tickers if len(tickers) > 1 else tickers[0],
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False,
+            session=session,
+        )
+        return raw
+    except Exception as e:
+        raise ValueError(f"Could not fetch data from Yahoo Finance: {e}")
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
-DAYS = 252
+DAYS           = 252
 LOOKBACK_YEARS = 5
 
 FF5_URL = (
@@ -64,119 +98,78 @@ COLORS = [
 ]
 
 
-# ── Helper: strip timezone from any index ─────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def strip_tz(index):
-    """Remove timezone info from a DatetimeIndex so all series align cleanly."""
     if hasattr(index, "tz") and index.tz is not None:
         return index.tz_localize(None)
     return index
 
-
-# ── Helper: flatten any 2D column to 1D ──────────────────────────────────────
-def flatten_col(series):
-    """Flatten a Series or single-column DataFrame to a clean 1D Series."""
-    if isinstance(series, pd.DataFrame):
-        series = series.iloc[:, 0]
-    return pd.Series(
-        pd.to_numeric(series.values.flatten(), errors="coerce"),
-        index=series.index,
-        name=series.name,
-    )
-
-
-# ── Helper: safe percentile ───────────────────────────────────────────────────
 def safe_percentile(series, pct):
-    """Return np.percentile or a fallback if the series is empty."""
     clean = series.dropna()
-    if len(clean) == 0:
-        return -0.05
-    return np.percentile(clean, pct)
+    return np.percentile(clean, pct) if len(clean) > 0 else -0.05
 
-
-# ── Ticker validation ─────────────────────────────────────────────────────────
 def validate_tickers(tickers):
-    bad = []
-    for t in tickers:
-        try:
-            info = yf.Ticker(t).fast_info
-            price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
-            if price is None:
-                bad.append(t)
-        except Exception:
-            bad.append(t)
-    return bad
+    return []   # Skip validation — let the download handle bad tickers
 
 
 # ── Main data loader ──────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_portfolio_data(portfolio_tuple):
-    """
-    portfolio_tuple: tuple of (ticker, weight) pairs.
-    Returns a dict with everything the app needs.
-    Cached for 1 hour so repeated analysis is instant.
-    """
     portfolio = dict(portfolio_tuple)
     tickers   = list(portfolio.keys())
-    weights   = np.array(list(portfolio.values()))
 
     end       = datetime.today()
     start     = end - timedelta(days=LOOKBACK_YEARS * 365 + 30)
     start_str = start.strftime("%Y-%m-%d")
     end_str   = end.strftime("%Y-%m-%d")
 
-    # ── 1. Download stock prices ──────────────────────────────────────────────
-    raw = yf.download(
-        tickers,
-        start=start_str,
-        end=end_str,
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    # ── 1. Stock prices ───────────────────────────────────────────────────────
+    raw = yf_download(tickers, start_str, end_str)
 
-    # Handle MultiIndex vs single ticker
     if isinstance(raw.columns, pd.MultiIndex):
         prices = raw["Close"].copy()
     else:
         prices = raw[["Close"]].copy()
         prices.columns = tickers
 
-    # Strip timezone and flatten each column
     prices.index = strip_tz(prices.index)
     for col in prices.columns:
         prices[col] = pd.to_numeric(prices[col].values.flatten(), errors="coerce")
 
     prices = prices.dropna(how="all")
 
-    # Keep only tickers with enough data
     valid_tickers = [
         t for t in tickers
         if t in prices.columns and prices[t].notna().sum() > 100
     ]
     if not valid_tickers:
-        raise ValueError("No valid price data found. Check your tickers and try again.")
+        raise ValueError(
+            "No valid price data found. Yahoo Finance may be temporarily unavailable "
+            "on this server. Please try again in a few minutes."
+        )
 
-    prices       = prices[valid_tickers]
-    weights_arr  = np.array([portfolio[t] for t in valid_tickers])
-    weights_arr  = weights_arr / weights_arr.sum()   # re-normalise if any tickers dropped
-    returns      = prices.pct_change().dropna()
-    port_ret     = (returns * weights_arr).sum(axis=1)
+    prices      = prices[valid_tickers]
+    weights_arr = np.array([portfolio[t] for t in valid_tickers])
+    weights_arr = weights_arr / weights_arr.sum()
+    returns     = prices.pct_change().dropna()
+    port_ret    = (returns * weights_arr).sum(axis=1)
 
-    # ── 2. S&P 500 benchmark ──────────────────────────────────────────────────
-    sp_raw   = yf.download("^GSPC", start=start_str, end=end_str,
-                            auto_adjust=True, progress=False)
-    sp_index = strip_tz(sp_raw.index)
+    # ── 2. S&P 500 ────────────────────────────────────────────────────────────
+    sp_raw    = yf_download(["^GSPC"], start_str, end_str)
+    sp_close  = sp_raw["Close"] if isinstance(sp_raw.columns, pd.MultiIndex) else sp_raw[["Close"]]
+    sp_index  = strip_tz(sp_raw.index)
     sp500_ret = pd.Series(
-        sp_raw["Close"].values.flatten(),
+        sp_close.values.flatten(),
         index=sp_index,
         name="SP500",
     ).pct_change().dropna()
 
-    # ── 3. Company fundamentals ───────────────────────────────────────────────
+    # ── 3. Fundamentals ───────────────────────────────────────────────────────
+    session      = _get_yf_session()
     fundamentals = {}
     for ticker in valid_tickers:
         try:
-            info = yf.Ticker(ticker).info
+            info = yf.Ticker(ticker, session=session).info
             fundamentals[ticker] = {
                 "company":       info.get("longName", ticker),
                 "sector":        info.get("sector", "Unknown"),
@@ -193,13 +186,12 @@ def load_portfolio_data(portfolio_tuple):
                 "profit_margin": 0, "debt_equity": 0, "pe_ratio": 0,
             }
 
-    # Sector weights
     sector_weights = {}
     for t, w in zip(valid_tickers, weights_arr):
         sec = fundamentals[t]["sector"]
         sector_weights[sec] = sector_weights.get(sec, 0) + w * 100
 
-    # ── 4. Fama-French 5-factor data ──────────────────────────────────────────
+    # ── 4. Fama-French factors ────────────────────────────────────────────────
     ff_factors = None
     try:
         resp = requests.get(FF5_URL, timeout=20)
@@ -230,24 +222,24 @@ def load_portfolio_data(portfolio_tuple):
         ff_factors = ff_raw.loc[start_str:end_str].dropna()
 
     except Exception:
-        # Fallback: approximate factors from S&P 500 when Dartmouth is unreachable
-        common_idx = port_ret.index
+        # Fallback factors approximated from S&P 500
+        idx = port_ret.index
         ff_factors = pd.DataFrame({
-            "Mkt-RF": sp500_ret.reindex(common_idx).fillna(0) - 0.000018,
-            "SMB":    np.random.normal(0.0001, 0.004, len(common_idx)),
-            "HML":    np.random.normal(0.0001, 0.004, len(common_idx)),
-            "RMW":    np.random.normal(0.0001, 0.003, len(common_idx)),
-            "CMA":    np.random.normal(0.0001, 0.003, len(common_idx)),
-            "RF":     np.full(len(common_idx), 0.000018),
-        }, index=common_idx)
+            "Mkt-RF": sp500_ret.reindex(idx).fillna(0) - 0.000018,
+            "SMB":    np.random.normal(0.0001, 0.004, len(idx)),
+            "HML":    np.random.normal(0.0001, 0.004, len(idx)),
+            "RMW":    np.random.normal(0.0001, 0.003, len(idx)),
+            "CMA":    np.random.normal(0.0001, 0.003, len(idx)),
+            "RF":     np.full(len(idx), 0.000018),
+        }, index=idx)
 
-    # ── 5. Align all series on common dates ───────────────────────────────────
-    common   = port_ret.index.intersection(ff_factors.index).intersection(sp500_ret.index)
-    port_a   = port_ret.loc[common]
-    ff_a     = ff_factors.loc[common]
-    sp500_a  = sp500_ret.loc[common]
-    ret_a    = returns.reindex(common).dropna(how="all")
-    excess   = port_a - ff_a["RF"]
+    # ── 5. Align all series ───────────────────────────────────────────────────
+    common  = port_ret.index.intersection(ff_factors.index).intersection(sp500_ret.index)
+    port_a  = port_ret.loc[common]
+    ff_a    = ff_factors.loc[common]
+    sp500_a = sp500_ret.loc[common]
+    ret_a   = returns.reindex(common).dropna(how="all")
+    excess  = port_a - ff_a["RF"]
 
     # ── 6. Risk metrics ───────────────────────────────────────────────────────
     ann_ret  = port_a.mean() * DAYS
@@ -255,11 +247,11 @@ def load_portfolio_data(portfolio_tuple):
     ann_rf   = ff_a["RF"].mean() * DAYS
     sharpe   = (ann_ret - ann_rf) / ann_vol if ann_vol > 0 else 0.0
 
-    cum      = (1 + port_a).cumprod()
-    max_dd   = ((cum - cum.cummax()) / cum.cummax()).min()
+    cum    = (1 + port_a).cumprod()
+    max_dd = ((cum - cum.cummax()) / cum.cummax()).min()
 
-    monthly  = port_a.resample("ME").apply(lambda x: (1 + x).prod() - 1)
-    var95    = safe_percentile(monthly, 5)
+    monthly = port_a.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+    var95   = safe_percentile(monthly, 5)
 
     port_1d  = np.asarray(port_a).flatten()
     sp500_1d = np.asarray(sp500_a).flatten()
@@ -272,10 +264,10 @@ def load_portfolio_data(portfolio_tuple):
     sp500_sharpe = (sp500_ann - ann_rf) / sp500_vol if sp500_vol > 0 else 0.0
     cum_sp500    = (1 + sp500_a).cumprod()
 
-    # ── 7. Fama-French factor regression ──────────────────────────────────────
-    X = ff_a[["Mkt-RF","SMB","HML","RMW","CMA"]].values
-    y = excess.values
-    fm           = LinearRegression().fit(X, y)
+    # ── 7. Factor regression ──────────────────────────────────────────────────
+    X  = ff_a[["Mkt-RF","SMB","HML","RMW","CMA"]].values
+    y  = excess.values
+    fm = LinearRegression().fit(X, y)
     factor_betas = dict(zip(["Mkt-RF","SMB","HML","RMW","CMA"], fm.coef_))
     alpha        = fm.intercept_ * DAYS
     r_squared    = fm.score(X, y)
@@ -289,14 +281,7 @@ def load_portfolio_data(portfolio_tuple):
 
     # ── 9. FX data ────────────────────────────────────────────────────────────
     fx_tickers = list(FX_PAIRS.keys())
-    raw_fx = yf.download(
-        fx_tickers,
-        start=start_str,
-        end=end_str,
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    raw_fx     = yf_download(fx_tickers, start_str, end_str)
 
     if isinstance(raw_fx.columns, pd.MultiIndex):
         fx_prices = raw_fx["Close"].copy()
@@ -304,7 +289,6 @@ def load_portfolio_data(portfolio_tuple):
         fx_prices = raw_fx[["Close"]].copy()
         fx_prices.columns = fx_tickers
 
-    # Strip timezone and flatten
     fx_prices.index = strip_tz(fx_prices.index)
     for col in fx_prices.columns:
         fx_prices[col] = pd.to_numeric(fx_prices[col].values.flatten(), errors="coerce")
@@ -312,22 +296,21 @@ def load_portfolio_data(portfolio_tuple):
     fx_prices  = fx_prices.dropna(how="all").ffill()
     fx_returns = fx_prices.pct_change().dropna()
 
-    # FX risk metrics per pair
     fx_rows = []
     for ticker, (name, quote, base) in FX_PAIRS.items():
         if ticker not in fx_returns.columns:
             continue
-        ret_fx  = fx_returns[ticker].dropna()
+        ret_fx = fx_returns[ticker].dropna()
         if len(ret_fx) < 30:
             continue
-        av      = ret_fx.std()  * np.sqrt(DAYS)
-        ar      = ret_fx.mean() * DAYS
-        sh      = ar / av if av > 0 else 0.0
-        carry   = CARRY_RATES.get(base, 0.03) - CARRY_RATES.get(quote, 0.03)
-        m_fx    = ret_fx.resample("ME").apply(lambda x: (1 + x).prod() - 1)
-        v95_fx  = safe_percentile(m_fx, 5)
-        c_fx    = (1 + ret_fx).cumprod()
-        mdd_fx  = ((c_fx - c_fx.cummax()) / c_fx.cummax()).min()
+        av     = ret_fx.std()  * np.sqrt(DAYS)
+        ar     = ret_fx.mean() * DAYS
+        sh     = ar / av if av > 0 else 0.0
+        carry  = CARRY_RATES.get(base, 0.03) - CARRY_RATES.get(quote, 0.03)
+        m_fx   = ret_fx.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+        v95_fx = safe_percentile(m_fx, 5)
+        c_fx   = (1 + ret_fx).cumprod()
+        mdd_fx = ((c_fx - c_fx.cummax()) / c_fx.cummax()).min()
         fx_rows.append(dict(
             ticker=ticker, name=name, base=base, quote=quote,
             ann_ret=ar, ann_vol=av, sharpe=sh,
@@ -337,7 +320,6 @@ def load_portfolio_data(portfolio_tuple):
     fx_metrics = pd.DataFrame(fx_rows).set_index("ticker") if fx_rows else pd.DataFrame()
     fx_corr    = fx_returns.corr()
 
-    # Portfolio FX exposure via sector defaults
     portfolio_fx = {}
     for t, w in zip(valid_tickers, weights_arr):
         sec      = fundamentals[t]["sector"]
@@ -348,22 +330,17 @@ def load_portfolio_data(portfolio_tuple):
 
     # ── 10. Return everything ─────────────────────────────────────────────────
     return {
-        # Config
         "portfolio":      portfolio,
         "tickers":        valid_tickers,
         "weights":        weights_arr,
         "start_date":     start_str,
         "end_date":       end_str,
-
-        # Price data
         "prices":         prices,
         "returns":        ret_a,
         "port_ret":       port_a,
         "sp500_ret":      sp500_a,
         "ff_factors":     ff_a,
         "excess":         excess,
-
-        # Risk metrics
         "ann_return":     ann_ret,
         "ann_vol":        ann_vol,
         "sharpe":         sharpe,
@@ -374,25 +351,17 @@ def load_portfolio_data(portfolio_tuple):
         "sp500_vol":      sp500_vol,
         "sp500_sharpe":   sp500_sharpe,
         "ann_rf":         ann_rf,
-
-        # Factor model
         "factor_betas":   factor_betas,
         "alpha":          alpha,
         "r_squared":      r_squared,
-
-        # Series
         "cum_port":       cum,
         "cum_sp500":      cum_sp500,
         "drawdown":       drawdown,
         "monthly_ret":    monthly,
         "rolling_sharpe": rolling_sharpe,
         "corr_matrix":    corr_matrix,
-
-        # Fundamentals
         "fundamentals":   fundamentals,
         "sector_weights": sector_weights,
-
-        # FX
         "fx_prices":      fx_prices,
         "fx_returns":     fx_returns,
         "fx_metrics":     fx_metrics,

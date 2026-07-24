@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from data_engine import load_portfolio_data, validate_tickers, COLORS
 
 st.set_page_config(
-    page_title  = "Analytics",
+    page_title  = "Portfolio Analytics",
     page_icon   = "📊",
     layout      = "wide",
     initial_sidebar_state = "expanded",
